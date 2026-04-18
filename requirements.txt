@@ -4,3 +4,4 @@ httpcore>=1.0.9
 httpx<0.29,>=0.27
 uvicorn
 starlette
+google-generativeai
