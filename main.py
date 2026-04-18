@@ -24,7 +24,7 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 def is_user_authorized(user_id: int) -> bool:
     if not ALLOWED_USERS:
-        return True  # если список пуст — доступ открыт всем (не рекомендуется для прода)
+        return True
     return user_id in ALLOWED_USERS
 
 def load_context_file():
