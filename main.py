@@ -1,30 +1,82 @@
 import logging
 import os
 import requests
+import base64
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- НАСТРОЙКИ (Замените на свои значения) ---
-TELEGRAM_BOT_TOKEN = "8792081322:AAEC0j2WhW2jJQXMBviJy8tbIR5M67SGUoE"
-DEEPSEEK_API_KEY = "sk-85543108341b4d26bc2257365a21b615"
-GITHUB_RAW_FILE_URL = "https://raw.githubusercontent.com/ВАШ_ЮЗЕРНЕЙМ/ВАШ_РЕПОЗИТОРИЙ/main/my_universe.txt"
-# --- КОНЕЦ НАСТРОЕК ---
+# --- НАСТРОЙКИ ---
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO = os.environ.get("GITHUB_REPO")
+GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH")
+AUTHORIZED_USER_IDS = os.environ.get("AUTHORIZED_USER_IDS", "")
+
+ALLOWED_USERS = []
+if AUTHORIZED_USER_IDS:
+    try:
+        ALLOWED_USERS = [int(uid.strip()) for uid in AUTHORIZED_USER_IDS.split(',') if uid.strip()]
+    except ValueError:
+        logging.error("Ошибка парсинга AUTHORIZED_USER_IDS. Проверьте, что ID указаны через запятую.")
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
+def is_user_authorized(user_id: int) -> bool:
+    if not ALLOWED_USERS:
+        return True  # если список пуст — доступ открыт всем (не рекомендуется для прода)
+    return user_id in ALLOWED_USERS
+
 def load_context_file():
-    try:
-        response = requests.get(GITHUB_RAW_FILE_URL)
-        response.raise_for_status()
-        return response.text
-    except Exception as e:
-        logging.error(f"Не удалось загрузить файл контекста: {e}")
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        content_b64 = response.json().get("content", "")
+        return base64.b64decode(content_b64).decode("utf-8")
+    else:
+        logging.error(f"Ошибка загрузки файла: {response.status_code}")
         return "Ошибка загрузки контекста"
 
+def save_journal_block(journal_text):
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    get_resp = requests.get(url, headers=headers)
+    if get_resp.status_code != 200:
+        logging.error("Не удалось получить файл для обновления")
+        return
+    file_data = get_resp.json()
+    current_content = base64.b64decode(file_data["content"]).decode("utf-8")
+    sha = file_data["sha"]
+    if journal_text.strip() not in current_content:
+        new_content = current_content.rstrip() + "\n\n" + journal_text.strip()
+    else:
+        new_content = current_content
+    update_payload = {
+        "message": "Автообновление журнала",
+        "content": base64.b64encode(new_content.encode("utf-8")).decode("utf-8"),
+        "sha": sha,
+        "branch": "main"
+    }
+    put_resp = requests.put(url, json=update_payload, headers=headers)
+    if put_resp.status_code in (200, 201):
+        logging.info("Журнал успешно обновлён")
+    else:
+        logging.error(f"Ошибка обновления журнала: {put_resp.status_code}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_user_authorized(user_id):
+        logging.warning(f"Неавторизованный доступ от user_id: {user_id}")
+        return
     await update.message.reply_text("Бот запущен. Отправьте сообщение, и оно будет обработано с учетом контекста.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_user_authorized(user_id):
+        logging.warning(f"Неавторизованный доступ от user_id: {user_id}")
+        return
+
     user_message = update.message.text
     context_file_content = load_context_file()
 
@@ -47,11 +99,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ai_response_text = response.json()["choices"][0]["message"]["content"]
         await update.message.reply_text(ai_response_text)
 
-        # Извлекаем блок с итогами для журнала
         journal_start = ai_response_text.find("=== ИТОГИ ДЛЯ ЖУРНАЛА ===")
         if journal_start != -1:
             journal_block = ai_response_text[journal_start:]
-            print(f"ЖУРНАЛ:\n{journal_block}")
+            save_journal_block(journal_block)
 
     except Exception as e:
         logging.error(f"Ошибка при обращении к DeepSeek API: {e}")
