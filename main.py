@@ -29,19 +29,23 @@ if AUTHORIZED_USER_IDS:
         logging.error("Ошибка парсинга AUTHORIZED_USER_IDS. Проверьте, что ID указаны через запятую.")
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def is_user_authorized(user_id: int) -> bool:
-    return True  # Временно пускаем всех
+    # ВРЕМЕННО ОТКЛЮЧЕНО ДЛЯ ДИАГНОСТИКИ
+    logger.info(f"Проверка авторизации для user_id={user_id} (фильтр отключён)")
+    return True
 
 def load_context_file():
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    logger.info(f"Загрузка контекста из {url}")
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
         content_b64 = response.json().get("content", "")
         return base64.b64decode(content_b64).decode("utf-8")
     else:
-        logging.error(f"Ошибка загрузки файла: {response.status_code}")
+        logger.error(f"Ошибка загрузки файла: {response.status_code}")
         return "Ошибка загрузки контекста"
 
 def save_journal_block(journal_text):
@@ -49,7 +53,7 @@ def save_journal_block(journal_text):
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     get_resp = requests.get(url, headers=headers)
     if get_resp.status_code != 200:
-        logging.error("Не удалось получить файл для обновления")
+        logger.error("Не удалось получить файл для обновления")
         return
     file_data = get_resp.json()
     current_content = base64.b64decode(file_data["content"]).decode("utf-8")
@@ -66,25 +70,30 @@ def save_journal_block(journal_text):
     }
     put_resp = requests.put(url, json=update_payload, headers=headers)
     if put_resp.status_code in (200, 201):
-        logging.info("Журнал успешно обновлён")
+        logger.info("Журнал успешно обновлён")
     else:
-        logging.error(f"Ошибка обновления журнала: {put_resp.status_code}")
+        logger.error(f"Ошибка обновления журнала: {put_resp.status_code}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Обработчик /start вызван. user_id={update.effective_user.id}")
     user_id = update.effective_user.id
     if not is_user_authorized(user_id):
-        logging.warning(f"Неавторизованный доступ от user_id: {user_id}")
+        logger.warning(f"Неавторизованный доступ от user_id: {user_id}")
         return
     await update.message.reply_text("Бот запущен. Отправьте сообщение, и оно будет обработано с учетом контекста.")
+    logger.info("Ответ на /start отправлен")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Обработчик сообщения вызван. user_id={update.effective_user.id}, текст={update.message.text[:50] if update.message.text else 'нет текста'}")
     user_id = update.effective_user.id
     if not is_user_authorized(user_id):
-        logging.warning(f"Неавторизованный доступ от user_id: {user_id}")
+        logger.warning(f"Неавторизованный доступ от user_id: {user_id}")
         return
 
     user_message = update.message.text
+    logger.info("Загрузка контекста...")
     context_file_content = load_context_file()
+    logger.info(f"Контекст загружен, длина {len(context_file_content)} символов")
 
     deepseek_payload = {
         "model": "deepseek-chat",
@@ -100,10 +109,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
 
     try:
-        response = requests.post("https://api.deepseek.com/v1/chat/completions", json=deepseek_payload, headers=headers)
+        logger.info("Отправка запроса к DeepSeek API...")
+        response = requests.post("https://api.deepseek.com/v1/chat/completions", json=deepseek_payload, headers=headers, timeout=30)
         response.raise_for_status()
         ai_response_text = response.json()["choices"][0]["message"]["content"]
+        logger.info(f"Ответ от DeepSeek получен, длина {len(ai_response_text)}")
         await update.message.reply_text(ai_response_text)
+        logger.info("Ответ отправлен в Telegram")
 
         journal_start = ai_response_text.find("=== ИТОГИ ДЛЯ ЖУРНАЛА ===")
         if journal_start != -1:
@@ -111,13 +123,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_journal_block(journal_block)
 
     except Exception as e:
-        logging.error(f"Ошибка при обращении к DeepSeek API: {e}")
+        logger.error(f"Ошибка при обращении к DeepSeek API: {e}", exc_info=True)
         await update.message.reply_text("Произошла ошибка при обработке запроса.")
 
 async def telegram_webhook(request: Request):
+    logger.info("Webhook вызван")
     app = request.app.state.tg_app
     data = await request.body()
-    await app.update_queue.put(Update.de_json(await request.json(), app.bot))
+    try:
+        update = Update.de_json(await request.json(), app.bot)
+        logger.info(f"Получен update: {update.update_id}")
+        await app.update_queue.put(update)
+    except Exception as e:
+        logger.error(f"Ошибка разбора update: {e}", exc_info=True)
     return Response()
 
 async def healthcheck(_):
@@ -125,20 +143,30 @@ async def healthcheck(_):
 
 async def self_ping():
     while True:
-        await asyncio.sleep(600)  # 10 минут
+        await asyncio.sleep(600)
         try:
             requests.get(f"{RENDER_EXTERNAL_URL}/healthcheck", timeout=5)
-            logging.info("Self-ping successful")
+            logger.info("Self-ping successful")
         except Exception as e:
-            logging.error(f"Self-ping failed: {e}")
+            logger.error(f"Self-ping failed: {e}")
 
 async def main():
+    logger.info("Проверка переменных окружения:")
+    logger.info(f"TELEGRAM_BOT_TOKEN: {'установлен' if TELEGRAM_BOT_TOKEN else 'ОТСУТСТВУЕТ'}")
+    logger.info(f"DEEPSEEK_API_KEY: {'установлен' if DEEPSEEK_API_KEY else 'ОТСУТСТВУЕТ'}")
+    logger.info(f"GITHUB_TOKEN: {'установлен' if GITHUB_TOKEN else 'ОТСУТСТВУЕТ'}")
+    logger.info(f"GITHUB_REPO: {GITHUB_REPO}")
+    logger.info(f"GITHUB_FILE_PATH: {GITHUB_FILE_PATH}")
+    logger.info(f"RENDER_EXTERNAL_URL: {RENDER_EXTERNAL_URL}")
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     await app.initialize()
-    await app.bot.set_webhook(f"{RENDER_EXTERNAL_URL}/telegram")
+    webhook_url = f"{RENDER_EXTERNAL_URL}/telegram"
+    logger.info(f"Установка вебхука: {webhook_url}")
+    await app.bot.set_webhook(webhook_url)
 
     asyncio.create_task(self_ping())
 
