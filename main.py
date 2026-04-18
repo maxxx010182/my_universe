@@ -32,7 +32,7 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 def is_user_authorized(user_id: int) -> bool:
-    # ВРЕМЕННО ОТКЛЮЧЕНО ДЛЯ ДИАГНОСТИКИ
+    # ВРЕМЕННО ОТКЛЮЧЕНО ДЛЯ ДИАГНОСТИКИ (убедитесь, что бот отвечает)
     logger.info(f"Проверка авторизации для user_id={user_id} (фильтр отключён)")
     return True
 
@@ -164,6 +164,8 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     await app.initialize()
+    await app.start()  # ← КРИТИЧЕСКИ ВАЖНО! Запускает обработку входящих обновлений
+
     webhook_url = f"{RENDER_EXTERNAL_URL}/telegram"
     logger.info(f"Установка вебхука: {webhook_url}")
     await app.bot.set_webhook(webhook_url)
@@ -179,6 +181,8 @@ async def main():
     config = uvicorn.Config(starlette_app, host="0.0.0.0", port=PORT, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
+
+    await app.stop()
     await app.shutdown()
 
 if __name__ == "__main__":
