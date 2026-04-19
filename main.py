@@ -3,7 +3,7 @@ import os
 import requests
 import base64
 import asyncio
-import google.generativeai as genai
+from groq import Groq
 from starlette.applications import Starlette
 from starlette.responses import Response, PlainTextResponse
 from starlette.requests import Request
@@ -14,7 +14,7 @@ import uvicorn
 
 # --- НАСТРОЙКИ ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO")
 GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH")
@@ -22,9 +22,9 @@ AUTHORIZED_USER_IDS = os.environ.get("AUTHORIZED_USER_IDS", "")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8000))
 
-# Настройка Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash')  # быстрая и бесплатная модель
+# Инициализация Groq клиента
+groq_client = Groq(api_key=GROQ_API_KEY)
+MODEL_NAME = "llama-3.3-70b-versatile"  # Отличная бесплатная модель с поддержкой русского
 
 ALLOWED_USERS = []
 if AUTHORIZED_USER_IDS:
@@ -37,7 +37,7 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 def is_user_authorized(user_id: int) -> bool:
-    # Временно отключено для проверки (позже включим)
+    # Временно отключено для диагностики (позже включим)
     logger.info(f"Проверка авторизации для user_id={user_id} (фильтр отключён)")
     return True
 
@@ -100,15 +100,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context_file_content = load_context_file()
     logger.info(f"Контекст загружен, длина {len(context_file_content)} символов")
 
-    # Формируем запрос к Gemini
     system_prompt = f"Ты — ИИ-агент, работающий с этим контекстом:\n\n{context_file_content}\n\nВсегда в конце ответа добавляй блок === ИТОГИ ДЛЯ ЖУРНАЛА ===, в котором будет краткая выжимка для сохранения в файл my_universe.txt."
-    full_prompt = f"{system_prompt}\n\nПользователь: {user_message}\nОтвет:"
 
     try:
-        logger.info("Отправка запроса к Gemini API...")
-        response = model.generate_content(full_prompt)
-        ai_response_text = response.text
-        logger.info(f"Ответ от Gemini получен, длина {len(ai_response_text)}")
+        logger.info("Отправка запроса к Groq API...")
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            model=MODEL_NAME,
+            temperature=0.7,
+            max_tokens=4096,
+        )
+        ai_response_text = chat_completion.choices[0].message.content
+        logger.info(f"Ответ от Groq получен, длина {len(ai_response_text)}")
         await update.message.reply_text(ai_response_text)
         logger.info("Ответ отправлен в Telegram")
 
@@ -118,7 +124,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_journal_block(journal_block)
 
     except Exception as e:
-        logger.error(f"Ошибка при обращении к Gemini API: {e}", exc_info=True)
+        logger.error(f"Ошибка при обращении к Groq API: {e}", exc_info=True)
         await update.message.reply_text("Произошла ошибка при обработке запроса.")
 
 async def telegram_webhook(request: Request):
@@ -148,7 +154,7 @@ async def self_ping():
 async def main():
     logger.info("Проверка переменных окружения:")
     logger.info(f"TELEGRAM_BOT_TOKEN: {'установлен' if TELEGRAM_BOT_TOKEN else 'ОТСУТСТВУЕТ'}")
-    logger.info(f"GEMINI_API_KEY: {'установлен' if GEMINI_API_KEY else 'ОТСУТСТВУЕТ'}")
+    logger.info(f"GROQ_API_KEY: {'установлен' if GROQ_API_KEY else 'ОТСУТСТВУЕТ'}")
     logger.info(f"GITHUB_TOKEN: {'установлен' if GITHUB_TOKEN else 'ОТСУТСТВУЕТ'}")
     logger.info(f"GITHUB_REPO: {GITHUB_REPO}")
     logger.info(f"GITHUB_FILE_PATH: {GITHUB_FILE_PATH}")
