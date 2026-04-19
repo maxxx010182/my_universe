@@ -3,7 +3,7 @@ import os
 import requests
 import base64
 import asyncio
-from groq import Groq
+from groq import Groq, RateLimitError
 from starlette.applications import Starlette
 from starlette.responses import Response, PlainTextResponse
 from starlette.requests import Request
@@ -24,7 +24,12 @@ PORT = int(os.environ.get("PORT", 8000))
 
 # Инициализация Groq клиента
 groq_client = Groq(api_key=GROQ_API_KEY)
-MODEL_NAME = "llama-3.3-70b-versatile"
+# Модели в порядке приоритета (от лучшей к запасным)
+FALLBACK_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+]
 
 ALLOWED_USERS = []
 if AUTHORIZED_USER_IDS:
@@ -111,27 +116,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "НЕ ОБЪЯСНЯЙ свои действия. НЕ УПОМИНАЙ технические детали API или моделей. Просто выполняй роль."
     )
 
-    try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
-            model=MODEL_NAME,
-            temperature=0.5,
-            max_tokens=4096,
-        )
-        ai_response_text = chat_completion.choices[0].message.content
-        await update.message.reply_text(ai_response_text)
+    last_exception = None
+    for model_name in FALLBACK_MODELS:
+        try:
+            logger.info(f"Попытка запроса к модели: {model_name}")
+            chat_completion = groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                model=model_name,
+                temperature=0.5,
+                max_tokens=4096,
+            )
+            ai_response_text = chat_completion.choices[0].message.content
+            logger.info(f"Модель {model_name} ответила успешно.")
+            await update.message.reply_text(ai_response_text)
 
-        journal_start = ai_response_text.find("=== ИТОГИ ДЛЯ ЖУРНАЛА ===")
-        if journal_start != -1:
-            journal_block = ai_response_text[journal_start:]
-            save_journal_block(journal_block)
+            journal_start = ai_response_text.find("=== ИТОГИ ДЛЯ ЖУРНАЛА ===")
+            if journal_start != -1:
+                journal_block = ai_response_text[journal_start:]
+                save_journal_block(journal_block)
+            return  # Успешно завершаем выполнение функции
 
-    except Exception as e:
-        logger.error(f"Ошибка Groq API: {e}", exc_info=True)
-        await update.message.reply_text("Произошла ошибка при обработке запроса.")
+        except RateLimitError as e:
+            logger.warning(f"Модель {model_name} исчерпала лимит: {e}")
+            last_exception = e
+            continue  # Переходим к следующей модели
+        except Exception as e:
+            # Если произошла другая ошибка, не связанная с лимитом, логируем и прекращаем попытки
+            logger.error(f"Неожиданная ошибка при использовании модели {model_name}: {e}", exc_info=True)
+            last_exception = e
+            break
+
+    # Если мы вышли из цикла, значит, все модели недоступны
+    logger.error("Все модели Groq исчерпали лимиты или недоступны.")
+    await update.message.reply_text("Все голосовые ассистенты временно заняты. Пожалуйста, повторите попытку через несколько минут.")
 
 async def telegram_webhook(request: Request):
     app = request.app.state.tg_app
