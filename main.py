@@ -3,6 +3,7 @@ import os
 import requests
 import base64
 import asyncio
+import time
 from groq import Groq, RateLimitError
 from starlette.applications import Starlette
 from starlette.responses import Response, PlainTextResponse
@@ -22,14 +23,16 @@ AUTHORIZED_USER_IDS = os.environ.get("AUTHORIZED_USER_IDS", "")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8000))
 
-# Инициализация Groq клиента
 groq_client = Groq(api_key=GROQ_API_KEY)
-# Модели в порядке приоритета (от лучшей к запасным)
 FALLBACK_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "mixtral-8x7b-32768",
 ]
+
+# --- КЭШИРОВАНИЕ КОНТЕКСТА ---
+_cached_context = {"content": "", "sha": "", "last_check": 0}
+CACHE_TTL = 1800  # проверять обновления раз в 30 минут
 
 ALLOWED_USERS = []
 if AUTHORIZED_USER_IDS:
@@ -42,22 +45,43 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 def is_user_authorized(user_id: int) -> bool:
-    logger.info(f"Проверка авторизации для user_id={user_id}")
     if not ALLOWED_USERS:
         return True
     return user_id in ALLOWED_USERS
 
-def load_context_file():
+def get_context_file():
+    """Возвращает содержимое файла контекста с кэшированием."""
+    global _cached_context
+    now = time.time()
+
+    # Если кэш свежий — возвращаем
+    if _cached_context["content"] and (now - _cached_context["last_check"]) < CACHE_TTL:
+        return _cached_context["content"]
+
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    logger.info(f"Загрузка контекста из {url}")
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        content_b64 = response.json().get("content", "")
-        return base64.b64decode(content_b64).decode("utf-8")
-    else:
-        logger.error(f"Ошибка загрузки файла: {response.status_code}")
-        return "Ошибка загрузки контекста"
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            new_sha = data.get("sha", "")
+            # Если SHA не изменился — продлеваем кэш
+            if new_sha == _cached_context["sha"] and _cached_context["content"]:
+                _cached_context["last_check"] = now
+                return _cached_context["content"]
+
+            content_b64 = data.get("content", "")
+            content = base64.b64decode(content_b64).decode("utf-8")
+            _cached_context = {"content": content, "sha": new_sha, "last_check": now}
+            logger.info("Контекст обновлён из GitHub")
+            return content
+        else:
+            logger.error(f"Ошибка загрузки файла: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Исключение при загрузке контекста: {e}")
+
+    # Fallback — возвращаем старый кэш или ошибку
+    return _cached_context["content"] or "Ошибка загрузки контекста"
 
 def save_journal_block(journal_text):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
@@ -82,6 +106,9 @@ def save_journal_block(journal_text):
     put_resp = requests.put(url, json=update_payload, headers=headers)
     if put_resp.status_code in (200, 201):
         logger.info("Журнал успешно обновлён")
+        # Сбрасываем кэш, чтобы бот увидел изменения
+        global _cached_context
+        _cached_context["last_check"] = 0
     else:
         logger.error(f"Ошибка обновления журнала: {put_resp.status_code}")
 
@@ -97,29 +124,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_message = update.message.text
-    context_file_content = load_context_file()
+    context_content = get_context_file()
 
-    system_prompt = (
-        "Ты — персональный ИИ-ассистент Максима Мошкина. Твоя задача — работать строго в рамках ролей (агентов), описанных в файле контекста.\n\n"
-        "ФАЙЛ КОНТЕКСТА (my_universe.txt):\n"
-        "```\n"
-        f"{context_file_content}\n"
-        "```\n\n"
-        "ИНСТРУКЦИИ:\n"
-        "1. Внимательно прочитай файл контекста. В нём описаны несколько агентов: ГЛАВРЕД, СТРАТЕГ, ХУДОЖНИК, БАИНГ, ТЕХНАРЬ.\n"
-        "2. Если пользователь пишет команду, начинающуюся с 'Включи' или 'Активируй', ты должен переключиться на соответствующего агента и ответить в его стиле.\n"
-        "3. Если пользователь пишет 'Переключиться на [ИМЯ АГЕНТА]', ты также меняешь роль.\n"
-        "4. Если явной команды нет, используй последнюю активную роль (по умолчанию - ГЛАВРЕД).\n"
-        "5. Отвечай только на русском языке (если не указано иное).\n"
-        "6. Следуй тону и стилю выбранного агента, как описано в файле.\n"
-        "7. В конце каждого ответа добавляй блок === ИТОГИ ДЛЯ ЖУРНАЛА ===, в котором кратко (1-3 предложения) описано, что было сделано. Этот блок будет автоматически сохранён в файл my_universe.txt.\n\n"
-        "НЕ ОБЪЯСНЯЙ свои действия. НЕ УПОМИНАЙ технические детали API или моделей. Просто выполняй роль."
-    )
+    # Облегчённый системный промпт
+    system_prompt = f"""Ты — ИИ-агент Максима Мошкина. Работай строго по ролям из файла ниже.
+
+=== ФАЙЛ КОНТЕКСТА ===
+{context_content}
+=== КОНЕЦ ФАЙЛА ===
+
+ПРАВИЛА:
+- Если сообщение начинается с "Включи" или "Активируй" — переключись на указанного агента (ГЛАВРЕД, СТРАТЕГ, ХУДОЖНИК, БАИНГ, ТЕХНАРЬ) и отвечай в его стиле.
+- Если явной команды нет, используй последнюю активную роль (по умолчанию ГЛАВРЕД).
+- Отвечай только на русском.
+- В конце каждого ответа добавляй блок === ИТОГИ ДЛЯ ЖУРНАЛА === с краткой выжимкой (1-3 предложения).
+- Не объясняй свои действия, не упоминай API, модели, технические детали.
+"""
 
     last_exception = None
     for model_name in FALLBACK_MODELS:
         try:
-            logger.info(f"Попытка запроса к модели: {model_name}")
+            logger.info(f"Запрос к модели {model_name}")
             chat_completion = groq_client.chat.completions.create(
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -127,40 +152,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ],
                 model=model_name,
                 temperature=0.5,
-                max_tokens=4096,
+                max_tokens=1500,  # уменьшено для экономии
             )
             ai_response_text = chat_completion.choices[0].message.content
-            logger.info(f"Модель {model_name} ответила успешно.")
             await update.message.reply_text(ai_response_text)
 
             journal_start = ai_response_text.find("=== ИТОГИ ДЛЯ ЖУРНАЛА ===")
             if journal_start != -1:
                 journal_block = ai_response_text[journal_start:]
                 save_journal_block(journal_block)
-            return  # Успешно завершаем выполнение функции
+            return
 
         except RateLimitError as e:
-            logger.warning(f"Модель {model_name} исчерпала лимит: {e}")
+            logger.warning(f"Модель {model_name} исчерпала лимит")
             last_exception = e
-            continue  # Переходим к следующей модели
+            continue
         except Exception as e:
-            # Если произошла другая ошибка, не связанная с лимитом, логируем и прекращаем попытки
-            logger.error(f"Неожиданная ошибка при использовании модели {model_name}: {e}", exc_info=True)
+            logger.error(f"Ошибка модели {model_name}: {e}", exc_info=True)
             last_exception = e
             break
 
-    # Если мы вышли из цикла, значит, все модели недоступны
-    logger.error("Все модели Groq исчерпали лимиты или недоступны.")
-    await update.message.reply_text("Все голосовые ассистенты временно заняты. Пожалуйста, повторите попытку через несколько минут.")
+    logger.error("Все модели недоступны")
+    await update.message.reply_text("Все голосовые ассистенты временно заняты. Попробуйте позже.")
 
 async def telegram_webhook(request: Request):
     app = request.app.state.tg_app
-    data = await request.body()
     try:
         update = Update.de_json(await request.json(), app.bot)
         await app.update_queue.put(update)
     except Exception as e:
-        logger.error(f"Ошибка разбора update: {e}", exc_info=True)
+        logger.error(f"Ошибка webhook: {e}", exc_info=True)
     return Response()
 
 async def healthcheck(_):
@@ -171,25 +192,18 @@ async def self_ping():
         await asyncio.sleep(600)
         try:
             requests.get(f"{RENDER_EXTERNAL_URL}/healthcheck", timeout=5)
-            logger.info("Self-ping successful")
-        except Exception as e:
-            logger.error(f"Self-ping failed: {e}")
+        except Exception:
+            pass
 
 async def main():
-    logger.info("Проверка переменных окружения:")
-    logger.info(f"TELEGRAM_BOT_TOKEN: {'установлен' if TELEGRAM_BOT_TOKEN else 'ОТСУТСТВУЕТ'}")
-    logger.info(f"GROQ_API_KEY: {'установлен' if GROQ_API_KEY else 'ОТСУТСТВУЕТ'}")
-    logger.info(f"GITHUB_TOKEN: {'установлен' if GITHUB_TOKEN else 'ОТСУТСТВУЕТ'}")
-
+    logger.info("Запуск бота...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     await app.initialize()
     await app.start()
-
-    webhook_url = f"{RENDER_EXTERNAL_URL}/telegram"
-    await app.bot.set_webhook(webhook_url)
+    await app.bot.set_webhook(f"{RENDER_EXTERNAL_URL}/telegram")
 
     asyncio.create_task(self_ping())
 
