@@ -4,7 +4,6 @@ import requests
 import base64
 import asyncio
 import time
-from groq import Groq, RateLimitError
 from starlette.applications import Starlette
 from starlette.responses import Response, PlainTextResponse
 from starlette.requests import Request
@@ -15,7 +14,7 @@ import uvicorn
 
 # --- НАСТРОЙКИ ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO")
 GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH")
@@ -23,16 +22,13 @@ AUTHORIZED_USER_IDS = os.environ.get("AUTHORIZED_USER_IDS", "")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8000))
 
-groq_client = Groq(api_key=GROQ_API_KEY)
-FALLBACK_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-]
+# Модель DeepSeek
+MODEL_NAME = "deepseek-chat"
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 
 # --- КЭШИРОВАНИЕ КОНТЕКСТА ---
 _cached_context = {"content": "", "sha": "", "last_check": 0}
-CACHE_TTL = 1800  # проверять обновления раз в 30 минут
+CACHE_TTL = 1800
 
 ALLOWED_USERS = []
 if AUTHORIZED_USER_IDS:
@@ -50,11 +46,8 @@ def is_user_authorized(user_id: int) -> bool:
     return user_id in ALLOWED_USERS
 
 def get_context_file():
-    """Возвращает содержимое файла контекста с кэшированием."""
     global _cached_context
     now = time.time()
-
-    # Если кэш свежий — возвращаем
     if _cached_context["content"] and (now - _cached_context["last_check"]) < CACHE_TTL:
         return _cached_context["content"]
 
@@ -65,7 +58,6 @@ def get_context_file():
         if response.status_code == 200:
             data = response.json()
             new_sha = data.get("sha", "")
-            # Если SHA не изменился — продлеваем кэш
             if new_sha == _cached_context["sha"] and _cached_context["content"]:
                 _cached_context["last_check"] = now
                 return _cached_context["content"]
@@ -79,8 +71,6 @@ def get_context_file():
             logger.error(f"Ошибка загрузки файла: {response.status_code}")
     except Exception as e:
         logger.error(f"Исключение при загрузке контекста: {e}")
-
-    # Fallback — возвращаем старый кэш или ошибку
     return _cached_context["content"] or "Ошибка загрузки контекста"
 
 def save_journal_block(journal_text):
@@ -106,7 +96,6 @@ def save_journal_block(journal_text):
     put_resp = requests.put(url, json=update_payload, headers=headers)
     if put_resp.status_code in (200, 201):
         logger.info("Журнал успешно обновлён")
-        # Сбрасываем кэш, чтобы бот увидел изменения
         global _cached_context
         _cached_context["last_check"] = 0
     else:
@@ -126,35 +115,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     context_content = get_context_file()
 
-    # Облегчённый системный промпт
-    system_prompt = f"""Ты — ИИ-агент Максима Мошкина. Твоя задача — строго следовать ролям, описанным в файле контекста ниже.
+    system_prompt = f"""Ты — ИИ-агент Максима Мошкина. Работай строго по ролям из файла ниже.
 
-=== НАЧАЛО ФАЙЛА КОНТЕКСТА ===
+=== ФАЙЛ КОНТЕКСТА ===
 {context_content}
-=== КОНЕЦ ФАЙЛА КОНТЕКСТА ===
+=== КОНЕЦ ФАЙЛА ===
 
-ВАЖНЫЕ ПРАВИЛА:
-1. В файле контекста есть раздел "ПРОФИЛИ АГЕНТОВ" с описаниями: ГЛАВРЕД, СТРАТЕГ, ХУДОЖНИК, БАИНГ, ТЕХНАРЬ.
-2. Если пользователь пишет "Включи [ИМЯ]" или "Активируй [ИМЯ]" — найди этого агента в файле и отвечай строго в его стиле.
-3. Если пользователь спрашивает об умениях агентов — перечисли их кратко, основываясь ТОЛЬКО на информации из файла.
-4. Если описание агента отсутствует в файле — скажи: "Этот агент пока не настроен. Использую ГЛАВРЕДА по умолчанию."
-5. Отвечай на русском. В конце — блок === ИТОГИ ДЛЯ ЖУРНАЛА === (1-3 предложения).
+ПРАВИЛА:
+- Если сообщение начинается с "Включи" или "Активируй" — переключись на указанного агента (ГЛАВРЕД, СТРАТЕГ, ХУДОЖНИК, БАИНГ, ТЕХНАРЬ) и отвечай в его стиле.
+- Если явной команды нет, используй последнюю активную роль (по умолчанию ГЛАВРЕД).
+- Отвечай только на русском.
+- В конце каждого ответа добавляй блок === ИТОГИ ДЛЯ ЖУРНАЛА === с краткой выжимкой (1-3 предложения).
+- Не объясняй свои действия, не упоминай API, модели, технические детали.
 """
 
-    last_exception = None
-    for model_name in FALLBACK_MODELS:
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        "temperature": 0.5,
+        "max_tokens": 1500,
+    }
+
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            logger.info(f"Запрос к модели {model_name}")
-            chat_completion = groq_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                model=model_name,
-                temperature=0.5,
-                max_tokens=1500,  # уменьшено для экономии
-            )
-            ai_response_text = chat_completion.choices[0].message.content
+            response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            ai_response_text = response.json()["choices"][0]["message"]["content"]
             await update.message.reply_text(ai_response_text)
 
             journal_start = ai_response_text.find("=== ИТОГИ ДЛЯ ЖУРНАЛА ===")
@@ -163,17 +157,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_journal_block(journal_block)
             return
 
-        except RateLimitError as e:
-            logger.warning(f"Модель {model_name} исчерпала лимит")
-            last_exception = e
-            continue
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                wait_time = 2 ** attempt
+                logger.warning(f"Ошибка 429. Попытка {attempt + 1}/{max_retries}. Ожидание {wait_time} сек.")
+                await asyncio.sleep(wait_time)
+                continue
+            elif e.response.status_code == 402:
+                logger.error("Ошибка 402: Недостаточно средств или не активирован бесплатный тариф.")
+                await update.message.reply_text("Ошибка: проверьте баланс и статус бесплатного тарифа в кабинете DeepSeek.")
+                return
+            else:
+                logger.error(f"Ошибка DeepSeek API: {e}", exc_info=True)
+                await update.message.reply_text("Произошла ошибка при обработке запроса.")
+                return
         except Exception as e:
-            logger.error(f"Ошибка модели {model_name}: {e}", exc_info=True)
-            last_exception = e
-            break
-
-    logger.error("Все модели недоступны")
-    await update.message.reply_text("Все голосовые ассистенты временно заняты. Попробуйте позже.")
+            logger.error(f"Неизвестная ошибка: {e}", exc_info=True)
+            await update.message.reply_text("Произошла ошибка при обработке запроса.")
+            return
 
 async def telegram_webhook(request: Request):
     app = request.app.state.tg_app
