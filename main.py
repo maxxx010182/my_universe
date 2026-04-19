@@ -1,122 +1,28 @@
-import logging
-import os
-import requests
-import base64
-import asyncio
-from groq import Groq
-from starlette.applications import Starlette
-from starlette.responses import Response, PlainTextResponse
-from starlette.requests import Request
-from starlette.routing import Route
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import uvicorn
 
-# --- НАСТРОЙКИ ---
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")
-GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH")
-AUTHORIZED_USER_IDS = os.environ.get("AUTHORIZED_USER_IDS", "")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
-PORT = int(os.environ.get("PORT", 8000))
+ИНСТРУКЦИИ:
+1. Внимательно прочитай файл контекста. В нём описаны несколько агентов: ГЛАВРЕД, СТРАТЕГ, ХУДОЖНИК, БАИНГ, ТЕХНАРЬ.
+2. Если пользователь пишет команду, начинающуюся с "Включи" или "Активируй", ты должен переключиться на соответствующего агента и ответить в его стиле.
+3. Если пользователь пишет "Переключиться на [ИМЯ АГЕНТА]", ты также меняешь роль.
+4. Если явной команды нет, используй последнюю активную роль (по умолчанию — ГЛАВРЕД).
+5. Отвечай **только на русском языке** (если не указано иное).
+6. Следуй тону и стилю выбранного агента, как описано в файле.
+7. В конце каждого ответа добавляй блок === ИТОГИ ДЛЯ ЖУРНАЛА ===, в котором кратко (1-3 предложения) описано, что было сделано. Этот блок будет автоматически сохранён в файл my_universe.txt.
 
-# Инициализация Groq клиента
-groq_client = Groq(api_key=GROQ_API_KEY)
-MODEL_NAME = "llama-3.3-70b-versatile"  # Отличная бесплатная модель с поддержкой русского
-
-ALLOWED_USERS = []
-if AUTHORIZED_USER_IDS:
-    try:
-        ALLOWED_USERS = [int(uid.strip()) for uid in AUTHORIZED_USER_IDS.split(',') if uid.strip()]
-    except ValueError:
-        logging.error("Ошибка парсинга AUTHORIZED_USER_IDS. Проверьте, что ID указаны через запятую.")
-
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-def is_user_authorized(user_id: int) -> bool:
-    # Временно отключено для диагностики (позже включим)
-    logger.info(f"Проверка авторизации для user_id={user_id} (фильтр отключён)")
-    return True
-
-def load_context_file():
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    logger.info(f"Загрузка контекста из {url}")
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        content_b64 = response.json().get("content", "")
-        return base64.b64decode(content_b64).decode("utf-8")
-    else:
-        logger.error(f"Ошибка загрузки файла: {response.status_code}")
-        return "Ошибка загрузки контекста"
-
-def save_journal_block(journal_text):
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    get_resp = requests.get(url, headers=headers)
-    if get_resp.status_code != 200:
-        logger.error("Не удалось получить файл для обновления")
-        return
-    file_data = get_resp.json()
-    current_content = base64.b64decode(file_data["content"]).decode("utf-8")
-    sha = file_data["sha"]
-    if journal_text.strip() not in current_content:
-        new_content = current_content.rstrip() + "\n\n" + journal_text.strip()
-    else:
-        new_content = current_content
-    update_payload = {
-        "message": "Автообновление журнала",
-        "content": base64.b64encode(new_content.encode("utf-8")).decode("utf-8"),
-        "sha": sha,
-        "branch": "main"
-    }
-    put_resp = requests.put(url, json=update_payload, headers=headers)
-    if put_resp.status_code in (200, 201):
-        logger.info("Журнал успешно обновлён")
-    else:
-        logger.error(f"Ошибка обновления журнала: {put_resp.status_code}")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Обработчик /start вызван. user_id={update.effective_user.id}")
-    user_id = update.effective_user.id
-    if not is_user_authorized(user_id):
-        logger.warning(f"Неавторизованный доступ от user_id: {user_id}")
-        return
-    await update.message.reply_text("Бот запущен. Отправьте сообщение, и оно будет обработано с учетом контекста.")
-    logger.info("Ответ на /start отправлен")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Обработчик сообщения вызван. user_id={update.effective_user.id}, текст={update.message.text[:50] if update.message.text else 'нет текста'}")
-    user_id = update.effective_user.id
-    if not is_user_authorized(user_id):
-        logger.warning(f"Неавторизованный доступ от user_id: {user_id}")
-        return
-
-    user_message = update.message.text
-    logger.info("Загрузка контекста...")
-    context_file_content = load_context_file()
-    logger.info(f"Контекст загружен, длина {len(context_file_content)} символов")
-
-    system_prompt = f"Ты — ИИ-агент, работающий с этим контекстом:\n\n{context_file_content}\n\nВсегда в конце ответа добавляй блок === ИТОГИ ДЛЯ ЖУРНАЛА ===, в котором будет краткая выжимка для сохранения в файл my_universe.txt."
+НЕ ОБЪЯСНЯЙ свои действия. НЕ УПОМИНАЙ технические детали API или моделей. Просто выполняй роль.
+"""
 
     try:
-        logger.info("Отправка запроса к Groq API...")
         chat_completion = groq_client.chat.completions.create(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
             ],
             model=MODEL_NAME,
-            temperature=0.7,
+            temperature=0.5,  # Уменьшено для более предсказуемых ответов
             max_tokens=4096,
         )
         ai_response_text = chat_completion.choices[0].message.content
-        logger.info(f"Ответ от Groq получен, длина {len(ai_response_text)}")
         await update.message.reply_text(ai_response_text)
-        logger.info("Ответ отправлен в Telegram")
 
         journal_start = ai_response_text.find("=== ИТОГИ ДЛЯ ЖУРНАЛА ===")
         if journal_start != -1:
@@ -124,16 +30,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_journal_block(journal_block)
 
     except Exception as e:
-        logger.error(f"Ошибка при обращении к Groq API: {e}", exc_info=True)
+        logger.error(f"Ошибка Groq API: {e}", exc_info=True)
         await update.message.reply_text("Произошла ошибка при обработке запроса.")
 
 async def telegram_webhook(request: Request):
-    logger.info("Webhook вызван")
     app = request.app.state.tg_app
     data = await request.body()
     try:
         update = Update.de_json(await request.json(), app.bot)
-        logger.info(f"Получен update: {update.update_id}")
         await app.update_queue.put(update)
     except Exception as e:
         logger.error(f"Ошибка разбора update: {e}", exc_info=True)
@@ -156,9 +60,6 @@ async def main():
     logger.info(f"TELEGRAM_BOT_TOKEN: {'установлен' if TELEGRAM_BOT_TOKEN else 'ОТСУТСТВУЕТ'}")
     logger.info(f"GROQ_API_KEY: {'установлен' if GROQ_API_KEY else 'ОТСУТСТВУЕТ'}")
     logger.info(f"GITHUB_TOKEN: {'установлен' if GITHUB_TOKEN else 'ОТСУТСТВУЕТ'}")
-    logger.info(f"GITHUB_REPO: {GITHUB_REPO}")
-    logger.info(f"GITHUB_FILE_PATH: {GITHUB_FILE_PATH}")
-    logger.info(f"RENDER_EXTERNAL_URL: {RENDER_EXTERNAL_URL}")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -168,7 +69,6 @@ async def main():
     await app.start()
 
     webhook_url = f"{RENDER_EXTERNAL_URL}/telegram"
-    logger.info(f"Установка вебхука: {webhook_url}")
     await app.bot.set_webhook(webhook_url)
 
     asyncio.create_task(self_ping())
