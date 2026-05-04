@@ -6,15 +6,14 @@ import asyncio
 import time
 from starlette.applications import Starlette
 from starlette.responses import Response, PlainTextResponse
-from starlette.requests import Request
 from starlette.routing import Route
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import uvicorn
 
-# --- НАСТРОЙКИ ---
+# === НАСТРОЙКИ ===
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO")
 GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH")
@@ -22,11 +21,14 @@ AUTHORIZED_USER_IDS = os.environ.get("AUTHORIZED_USER_IDS", "")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8000))
 
-# Модель DeepSeek
-MODEL_NAME = "deepseek-chat"
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+# OpenRouter API настройки (бесплатная модель)
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Используем бесплатную модель DeepSeek через OpenRouter
+MODEL_NAME = "deepseek/deepseek-chat:free"
 
-# --- КЭШИРОВАНИЕ КОНТЕКСТА ---
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 _cached_context = {"content": "", "sha": "", "last_check": 0}
 CACHE_TTL = 1800
 
@@ -35,10 +37,7 @@ if AUTHORIZED_USER_IDS:
     try:
         ALLOWED_USERS = [int(uid.strip()) for uid in AUTHORIZED_USER_IDS.split(',') if uid.strip()]
     except ValueError:
-        logging.error("Ошибка парсинга AUTHORIZED_USER_IDS. Проверьте, что ID указаны через запятую.")
-
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+        logger.error("Ошибка парсинга AUTHORIZED_USER_IDS")
 
 def is_user_authorized(user_id: int) -> bool:
     if not ALLOWED_USERS:
@@ -105,7 +104,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_authorized(user_id):
         return
-    await update.message.reply_text("Бот запущен. Используйте команду 'Включи [ИМЯ АГЕНТА]' для активации нужной роли.")
+    await update.message.reply_text("Бот запущен. Используйте команду 'Включи [ИМЯ АГЕНТА]' для активации агента.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -130,8 +129,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
 
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": RENDER_EXTERNAL_URL,
+        "X-Title": "MyUniverse Bot"
     }
     payload = {
         "model": MODEL_NAME,
@@ -146,7 +147,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
+            response = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
             ai_response_text = response.json()["choices"][0]["message"]["content"]
             await update.message.reply_text(ai_response_text)
@@ -160,19 +161,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
                 wait_time = 2 ** attempt
-                logger.warning(f"Ошибка 429. Попытка {attempt + 1}/{max_retries}. Ожидание {wait_time} сек.")
+                logger.warning(f"Rate limit (429). Попытка {attempt + 1}/{max_retries}. Ожидание {wait_time} сек.")
                 await asyncio.sleep(wait_time)
                 continue
-            elif e.response.status_code == 402:
-                logger.error("Ошибка 402: Недостаточно средств или не активирован бесплатный тариф.")
-                await update.message.reply_text("Ошибка: проверьте баланс и статус бесплатного тарифа в кабинете DeepSeek.")
-                return
             else:
-                logger.error(f"Ошибка DeepSeek API: {e}", exc_info=True)
-                await update.message.reply_text("Произошла ошибка при обработке запроса.")
+                logger.error(f"Ошибка OpenRouter API: {e.response.status_code}")
+                await update.message.reply_text("Произошла ошибка при обработке запроса. Попробуй позже.")
                 return
         except Exception as e:
-            logger.error(f"Неизвестная ошибка: {e}", exc_info=True)
+            logger.error(f"Неизвестная ошибка: {e}")
             await update.message.reply_text("Произошла ошибка при обработке запроса.")
             return
 
@@ -182,7 +179,7 @@ async def telegram_webhook(request: Request):
         update = Update.de_json(await request.json(), app.bot)
         await app.update_queue.put(update)
     except Exception as e:
-        logger.error(f"Ошибка webhook: {e}", exc_info=True)
+        logger.error(f"Ошибка webhook: {e}")
     return Response()
 
 async def healthcheck(_):
@@ -197,7 +194,7 @@ async def self_ping():
             pass
 
 async def main():
-    logger.info("Запуск бота...")
+    logger.info("Запуск бота через OpenRouter (бесплатный тариф)")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
