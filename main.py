@@ -24,7 +24,7 @@ PORT = int(os.environ.get("PORT", 8000))
 # OpenRouter API настройки (бесплатная модель)
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Используем бесплатную модель DeepSeek через OpenRouter
-MODEL_NAME = "deepseek/deepseek-chat:free"
+MODEL_NAME = "microsoft/phi-3-medium-128k-instruct:free"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
