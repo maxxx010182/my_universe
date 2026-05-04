@@ -13,7 +13,8 @@ import uvicorn
 
 # === НАСТРОЙКИ ===
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Используем твой существующий ключ OpenRouter
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO")
 GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH")
@@ -21,8 +22,9 @@ AUTHORIZED_USER_IDS = os.environ.get("AUTHORIZED_USER_IDS", "")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8000))
 
-# ИСПРАВЛЕННЫЙ API URL (v1, а не v1beta)
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
+# OpenRouter настройки - самая стабильная бесплатная модель
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL_NAME = "microsoft/phi-3-medium-128k-instruct:free"
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -125,20 +127,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - В конце каждого ответа добавляй блок === ИТОГИ ДЛЯ ЖУРНАЛА === с краткой выжимкой (1-3 предложения).
 - Не объясняй свои действия, не упоминай API, модели, технические детали."""
 
-    url = f"{GEMINI_API_URL}?key={GEMINI_API_KEY}"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": RENDER_EXTERNAL_URL,
+        "X-Title": "MyUniverse Bot"
+    }
     payload = {
-        "contents": [{
-            "parts": [{"text": f"{system_prompt}\n\nПользователь: {user_message}"}]
-        }]
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        "temperature": 0.5,
+        "max_tokens": 1500,
     }
 
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = requests.post(url, json=payload, timeout=30)
+            response = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
-            data = response.json()
-            ai_response_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            ai_response_text = response.json()["choices"][0]["message"]["content"]
             await update.message.reply_text(ai_response_text)
 
             journal_start = ai_response_text.find("=== ИТОГИ ДЛЯ ЖУРНАЛА ===")
@@ -154,8 +164,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(wait_time)
                 continue
             else:
-                logger.error(f"Gemini ошибка: {e.response.status_code}")
-                await update.message.reply_text("Ошибка Gemini API. Попробуй позже.")
+                logger.error(f"OpenRouter ошибка: {e.response.status_code}")
+                await update.message.reply_text("Ошибка при обработке запроса. Попробуй позже.")
                 return
         except Exception as e:
             logger.error(f"Неизвестная ошибка: {e}")
@@ -183,7 +193,7 @@ async def self_ping():
             pass
 
 async def main():
-    logger.info("Запуск бота на Gemini (исправленный API v1)")
+    logger.info("Запуск бота через OpenRouter (бесплатная модель Phi-3)")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
