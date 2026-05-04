@@ -4,7 +4,6 @@ import requests
 import base64
 import asyncio
 import time
-import json
 from starlette.applications import Starlette
 from starlette.responses import Response, PlainTextResponse
 from starlette.routing import Route
@@ -22,14 +21,10 @@ AUTHORIZED_USER_IDS = os.environ.get("AUTHORIZED_USER_IDS", "")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8000))
 
-# Gemini API настройки
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+# ИСПРАВЛЕННЫЙ API URL (v1, а не v1beta)
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
 
-# Настройка логирования (теперь всё пишем в консоль Render)
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _cached_context = {"content": "", "sha": "", "last_check": 0}
@@ -106,20 +101,15 @@ def save_journal_block(journal_text):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_authorized(user_id):
-        logger.warning(f"Неавторизованный доступ от {user_id}")
         return
     await update.message.reply_text("✅ Бот запущен. Используй 'Включи [агента]' для активации.")
-    logger.info(f"Пользователь {user_id} запустил бота.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_authorized(user_id):
-        logger.warning(f"Неавторизованное сообщение от {user_id}")
         return
 
     user_message = update.message.text
-    logger.info(f"Обработка сообщения от {user_id}: {user_message[:50]}...") # Логируем начало сообщения
-
     context_content = get_context_file()
 
     system_prompt = f"""Ты — ИИ-агент Максима Мошкина. Работай строго по ролям из файла ниже.
@@ -129,11 +119,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 === КОНЕЦ ФАЙЛА ===
 
 ПРАВИЛА:
-- Если сообщение начинается с "Включи" или "Активируй" — переключись на указанного агента.
+- Если сообщение начинается с "Включи" или "Активируй" — переключись на указанного агента (ГЛАВРЕД, СТРАТЕГ, ХУДОЖНИК, БАИНГ, ТЕХНАРЬ) и отвечай в его стиле.
 - Если явной команды нет, используй последнюю активную роль (по умолчанию ГЛАВРЕД).
 - Отвечай только на русском.
-- В конце добавляй блок === ИТОГИ ДЛЯ ЖУРНАЛА ===.
-- Не упоминай API, модели, технические детали."""
+- В конце каждого ответа добавляй блок === ИТОГИ ДЛЯ ЖУРНАЛА === с краткой выжимкой (1-3 предложения).
+- Не объясняй свои действия, не упоминай API, модели, технические детали."""
 
     url = f"{GEMINI_API_URL}?key={GEMINI_API_KEY}"
     payload = {
@@ -142,30 +132,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }]
     }
 
-    logger.info(f"Отправка запроса в Gemini API...")
-    try:
-        response = requests.post(url, json=payload, timeout=30)
-        # Логируем HTTP статус ответа от Gemini
-        logger.info(f"Gemini API ответил с кодом: {response.status_code}")
-
-        if response.status_code == 200:
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, json=payload, timeout=30)
+            response.raise_for_status()
             data = response.json()
             ai_response_text = data["candidates"][0]["content"]["parts"][0]["text"]
             await update.message.reply_text(ai_response_text)
-            logger.info(f"Ответ от Gemini успешно отправлен пользователю {user_id}")
 
             journal_start = ai_response_text.find("=== ИТОГИ ДЛЯ ЖУРНАЛА ===")
             if journal_start != -1:
                 journal_block = ai_response_text[journal_start:]
                 save_journal_block(journal_block)
-        else:
-            # Логируем тело ошибки от Gemini
-            error_body = response.text
-            logger.error(f"Ошибка Gemini API: Код {response.status_code}. Тело ответа: {error_body}")
-            await update.message.reply_text(f"Ошибка Gemini API: Код {response.status_code}. Попробуй позже.")
-    except Exception as e:
-        logger.error(f"Исключение при запросе к Gemini: {e}")
-        await update.message.reply_text("Ошибка при обработке запроса.")
+            return
+
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                wait_time = 2 ** attempt
+                logger.warning(f"Rate limit. Попытка {attempt + 1}/{max_retries}. Ждём {wait_time} сек.")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Gemini ошибка: {e.response.status_code}")
+                await update.message.reply_text("Ошибка Gemini API. Попробуй позже.")
+                return
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка: {e}")
+            await update.message.reply_text("Ошибка при обработке запроса.")
+            return
 
 async def telegram_webhook(request: Request):
     app = request.app.state.tg_app
@@ -188,7 +183,7 @@ async def self_ping():
             pass
 
 async def main():
-    logger.info("Запуск бота на Gemini (бесплатно) с расширенным логированием")
+    logger.info("Запуск бота на Gemini (исправленный API v1)")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -196,10 +191,8 @@ async def main():
     await app.initialize()
     await app.start()
     await app.bot.set_webhook(f"{RENDER_EXTERNAL_URL}/telegram")
-    logger.info(f"Вебхук установлен: {RENDER_EXTERNAL_URL}/telegram")
 
     asyncio.create_task(self_ping())
-    logger.info("Self-ping задача запущена")
 
     starlette_app = Starlette(routes=[
         Route("/telegram", telegram_webhook, methods=["POST"]),
