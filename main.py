@@ -5,6 +5,7 @@ import base64
 import asyncio
 import time
 from starlette.applications import Starlette
+from starlette.requests import Request
 from starlette.responses import Response, PlainTextResponse
 from starlette.routing import Route
 from telegram import Update
@@ -13,7 +14,7 @@ import uvicorn
 
 # === НАСТРОЙКИ ===
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO")
 GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH")
@@ -21,8 +22,10 @@ AUTHORIZED_USER_IDS = os.environ.get("AUTHORIZED_USER_IDS", "")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8000))
 
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "deepseek/deepseek-chat:free"
+# Groq API настройки (бесплатно, без карты)
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+MODEL_NAME = "llama-3.3-70b-versatile"
+
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -101,7 +104,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_authorized(user_id):
         return
-    await update.message.reply_text("✅ Бот запущен. Используй 'Включи [агента]' для активации.")
+    await update.message.reply_text("Бот запущен. Используйте команду 'Включи [ИМЯ АГЕНТА]' для активации агента.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -122,13 +125,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Если явной команды нет, используй последнюю активную роль (по умолчанию ГЛАВРЕД).
 - Отвечай только на русском.
 - В конце каждого ответа добавляй блок === ИТОГИ ДЛЯ ЖУРНАЛА === с краткой выжимкой (1-3 предложения).
-- Не объясняй свои действия, не упоминай API, модели, технические детали."""
+- Не объясняй свои действия, не упоминай API, модели, технические детали.
+"""
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": RENDER_EXTERNAL_URL,
-        "X-Title": "MyUniverse Bot"
     }
     payload = {
         "model": MODEL_NAME,
@@ -143,7 +145,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=30)
+            response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
             ai_response_text = response.json()["choices"][0]["message"]["content"]
             await update.message.reply_text(ai_response_text)
@@ -157,16 +159,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
                 wait_time = 2 ** attempt
-                logger.warning(f"Rate limit. Попытка {attempt + 1}/{max_retries}. Ждём {wait_time} сек.")
+                logger.warning(f"Rate limit (429). Попытка {attempt + 1}/{max_retries}. Ожидание {wait_time} сек.")
                 await asyncio.sleep(wait_time)
                 continue
             else:
-                logger.error(f"OpenRouter ошибка: {e.response.status_code}")
-                await update.message.reply_text("Ошибка при обработке запроса. Попробуй позже.")
+                logger.error(f"Ошибка Groq API: {e.response.status_code}")
+                await update.message.reply_text("Произошла ошибка при обработке запроса. Попробуй позже.")
                 return
         except Exception as e:
             logger.error(f"Неизвестная ошибка: {e}")
-            await update.message.reply_text("Ошибка при обработке запроса.")
+            await update.message.reply_text("Произошла ошибка при обработке запроса.")
             return
 
 async def telegram_webhook(request: Request):
@@ -190,7 +192,7 @@ async def self_ping():
             pass
 
 async def main():
-    logger.info("Запуск бота через OpenRouter (бесплатная модель Phi-3)")
+    logger.info("Запуск бота через Groq (бесплатный тариф)")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
